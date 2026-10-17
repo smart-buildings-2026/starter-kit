@@ -1711,14 +1711,10 @@ class SimulationTracker:
             }
         )
 
-        # Occupancy
-        total_occupancy = 0.0
-        end_time = timestamp + pd.Timedelta(self.time_step_sec, unit="s")
-        for zone_id in self.zone_ids:
-            total_occupancy += self.env.building.occupancy.average_zone_occupancy(
-                zone_id, timestamp, end_time
-            )
-        self.occupancy.append(total_occupancy)
+        # Reuse the reward's room occupancy. self.zone_ids contains VAV IDs;
+        # querying occupancy with those creates fictitious populations and
+        # consumes random draws, changing subsequent simulation trajectories.
+        self.occupancy.append(float(reward_response.total_occupancy))
 
         # Zone temps
         temps = [vav.zone_air_temperature for vav in self.vavs.values()]
