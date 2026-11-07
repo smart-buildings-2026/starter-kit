@@ -185,7 +185,8 @@ buildings and scenarios as you like during development (the held-out evaluation
 buildings come from the same generator and ranges).
 
 ```bash
-# Sample 10 new buildings (seeds 500-509) as YAML + PDF previews
+# Sample new buildings from seeds 500-509 as YAML + PDF previews. Seeds whose
+# floor plan has a zone below 20 m2 are skipped and listed at the end.
 python -m smart_buildings.run_floor_generator --start-seed 500 --count 10
 
 # Turn buildings × weather strips into runnable scenarios
