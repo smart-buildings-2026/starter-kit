@@ -7,13 +7,13 @@ The `execute_step_sim` method is responsible for calculating the supply air
 temperature from the air handler(s) for the current simulation time step.
 
 First, it calculates the recirculation air temperature for each air handler
-unit (AHU). This is the area-weighted average temperature of all zones serviced
-by that AHU.
+unit (AHU). This is the air its VAVs extract from their zones, mixed in
+proportion to each VAV's airflow.
 
 It iterates through each Variable Air Volume (VAV) unit to find the average
 temperature of the zones it serves (v_sensing_temp), weighted by the area of
 each zone. It then calculates the recirculation temperature for each AHU by
-taking an area-weighted average of the v_sensing_temp of all VAVs connected
+taking an airflow-weighted average of the v_sensing_temp of all VAVs connected
 to it. Finally, it uses this per-AHU recirculation temperature and the outside
 ambient temperature to calculate the temperature of the air that will be
 supplied by each AHU. This logic handles both single and multiple AHU
@@ -289,13 +289,10 @@ class SimulatorFlexibleGeometries(simulator.Simulator[str]):
     avg_temps = self.building.get_zone_average_temps()
     ambient_temperature = self._weather_controller.get_current_temp(current_ts)
 
-    ahu_temp_weighted_sum = collections.defaultdict(float)
-    ahu_area_total = collections.defaultdict(float)
     vav_cached_data: dict[str, _VavZones] = {}
     vav_sensing_temp_map = {}
 
     for v_id, vav in hvac.vavs.items():
-      ahu_id = vav.air_handler.device_id()
       assigned_zones = [
           z for z in hvac.get_zones_for_vav(v_id) if z in avg_temps
       ]
@@ -315,23 +312,9 @@ class SimulatorFlexibleGeometries(simulator.Simulator[str]):
       )
       vav_sensing_temp_map[v_id] = v_sensing_temp
 
-      ahu_temp_weighted_sum[ahu_id] += v_sensing_temp * v_area
-      ahu_area_total[ahu_id] += v_area
-
-    if isinstance(hvac.air_handler, air_handler_py.AirHandlerSystem):
-      ahus = hvac.air_handler.ahus
-    else:
-      ahus = [hvac.air_handler]
-
-    recirculation_temps = {}
-    for ahu in ahus:
-      ahu_id = ahu.device_id()
-      if ahu_area_total.get(ahu_id, 0) > 0:
-        recirculation_temps[ahu_id] = (
-            ahu_temp_weighted_sum[ahu_id] / ahu_area_total[ahu_id]
-        )
-      else:
-        recirculation_temps[ahu_id] = self.building.temp.mean()
+    # After the loop: update_settings above sets the dampers this step's
+    # airflow, and so the mixing weights, depend on.
+    recirculation_temps = self._recirculation_temps(avg_temps)
 
     if isinstance(hvac.air_handler, air_handler_py.AirHandlerSystem):
       supply_air_temp = hvac.air_handler.get_supply_air_temp(
@@ -707,6 +690,71 @@ class SimulatorFlexibleGeometries(simulator.Simulator[str]):
       )
     return zone_reward_infos
 
+  def _recirculation_temps(
+      self, avg_temps: Mapping[str, float]
+  ) -> dict[str, float]:
+    """Returns each air handler's recirculated air temperature in K.
+
+    The return air is a mixture of the streams the VAVs extract from their
+    zones, so each VAV counts with its airflow. Within a VAV the zones count
+    with their floor area, because a VAV splits its air between its zones by
+    area.
+
+    The previous version weighted every VAV by floor area. That differs from
+    the enthalpy of the extracted air whenever airflow per unit area differs
+    between VAVs: sending most of the air through cold zones and little through
+    warm ones made the recirculated air warmer than the air that actually left
+    the zones, so the handler delivered heat that no stream carried, and its
+    mixing box generated negative entropy. The reverse gives free cooling. The
+    handler's flow cap scales every VAV it serves by the same ratio, so the
+    uncapped demand gives the same weights. A VAV the step skips (closed damper
+    or no maximum flow) delivers no air and gets no weight.
+
+    This corrects the spatial weighting only. The step still mixes
+    start-of-step zone temperatures while the zones exchange heat at their
+    end-of-step temperatures, a separate temporal-discretization error.
+
+    Args:
+      avg_temps: Average temperature in K of each zone.
+    """
+    room_areas = {z: len(c) for z, c in self.building.room_dict.items()}
+    flow_temp_sum = collections.defaultdict(float)
+    flow_total = collections.defaultdict(float)
+    area_temp_sum = collections.defaultdict(float)
+    area_total = collections.defaultdict(float)
+    for v_id, vav in self._hvac.vavs.items():
+      zones = [z for z in self._hvac.get_zones_for_vav(v_id) if z in avg_temps]
+      v_area = sum(room_areas[z] for z in zones)
+      if v_area <= 0:
+        continue
+      v_temp = sum(avg_temps[z] * room_areas[z] for z in zones) / v_area
+      ahu_id = vav.air_handler.device_id()
+      # Same condition as the step's air-side coupling below.
+      v_flow = (
+          vav.unrestricted_flow_rate_demand
+          if vav.damper_setting > 0 and vav.max_air_flow_rate > 0
+          else 0.0
+      )
+      flow_temp_sum[ahu_id] += v_temp * v_flow
+      flow_total[ahu_id] += v_flow
+      area_temp_sum[ahu_id] += v_temp * v_area
+      area_total[ahu_id] += v_area
+
+    if isinstance(self._hvac.air_handler, air_handler_py.AirHandlerSystem):
+      ahus = self._hvac.air_handler.ahus
+    else:
+      ahus = [self._hvac.air_handler]
+    temps = {}
+    for ahu in ahus:
+      ahu_id = ahu.device_id()
+      if flow_total.get(ahu_id, 0) > 0:
+        temps[ahu_id] = flow_temp_sum[ahu_id] / flow_total[ahu_id]
+      elif area_total.get(ahu_id, 0) > 0:  # no air moving: nothing to mix
+        temps[ahu_id] = area_temp_sum[ahu_id] / area_total[ahu_id]
+      else:
+        temps[ahu_id] = self.building.temp.mean()
+    return temps
+
   def _get_air_handler_reward_infos(
       self,
   ) -> Mapping[str, RewardInfo.AirHandlerRewardInfo]:
@@ -723,43 +771,9 @@ class SimulatorFlexibleGeometries(simulator.Simulator[str]):
     ambient_temp = self._weather_controller.get_current_temp(
         self._current_timestamp
     )
-    avg_temps = self.building.get_zone_average_temps()
-    room_dict = self.building.room_dict
-    room_areas = {z: len(coords) for z, coords in room_dict.items()}
-
-    ahu_temp_weighted_sum = collections.defaultdict(float)
-    ahu_area_total = collections.defaultdict(float)
-
-    for v_id, vav in self._hvac.vavs.items():
-      ahu_id = vav.air_handler.device_id()
-      assigned_zones = [
-          z for z in self._hvac.get_zones_for_vav(v_id) if z in avg_temps
-      ]
-      if not assigned_zones:
-        continue
-
-      v_area = sum(room_areas[z] for z in assigned_zones)
-      if v_area > 0:
-        v_sensing_temp = (
-            sum(avg_temps[z] * room_areas[z] for z in assigned_zones) / v_area
-        )
-        ahu_temp_weighted_sum[ahu_id] += v_sensing_temp * v_area
-        ahu_area_total[ahu_id] += v_area
-
-    if isinstance(self._hvac.air_handler, air_handler_py.AirHandlerSystem):
-      ahus = self._hvac.air_handler.ahus
-    else:
-      ahus = [self._hvac.air_handler]
-
-    recirculation_temps = {}
-    for ahu in ahus:
-      ahu_id = ahu.device_id()
-      if ahu_area_total.get(ahu_id, 0) > 0:
-        recirculation_temps[ahu_id] = (
-            ahu_temp_weighted_sum[ahu_id] / ahu_area_total[ahu_id]
-        )
-      else:
-        recirculation_temps[ahu_id] = self.building.temp.mean()
+    recirculation_temps = self._recirculation_temps(
+        self.building.get_zone_average_temps()
+    )
 
     if isinstance(self._hvac.air_handler, air_handler_py.AirHandlerSystem):
       recirculation_input = recirculation_temps
