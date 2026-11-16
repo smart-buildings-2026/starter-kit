@@ -54,6 +54,7 @@ from smart_buildings.smart_control.simulator import (
 )
 from smart_buildings.smart_control.simulator import boiler as boiler_py
 from smart_buildings.smart_control.simulator import pump as pump_py
+from smart_buildings.smart_control.utils import constants
 
 _SECONDS_PER_HOUR: float = 3600.0
 
@@ -290,6 +291,43 @@ class HotWaterSystem(smart_device.SmartDevice):
   def compute_pump_power(self):
     """Returns power consumed by pump in W to move water to VAVs."""
     return self._pump.compute_pump_power(self.total_flow_rate)
+
+  @property
+  def energy_balance(self) -> bool:
+    """Whether the heat source is an energy-balanced tank (see apply_heat_draw)."""
+    return bool(getattr(self._heat_source, "energy_balance", False))
+
+  def apply_heat_draw(
+      self,
+      outside_temp: float,
+      duration_s: float,
+      coil_heat_w: float | None = None,
+  ) -> None:
+    """Takes this step's water-loop heat out of an energy-balanced tank.
+
+    Call once per step, after return_water_temperature_sensor is updated. A
+    no-op for heat sources without an energy-balanced tank.
+
+    Args:
+      outside_temp: Temperature in K around the tank.
+      duration_s: Step length in seconds.
+      coil_heat_w: Heat the coils delivered this step, in W. When omitted it is
+        flow * (T_supply - T_return), which is exact only if the return
+        temperature comes from the coils' energy balance.
+    """
+    if not self.energy_balance:
+      return
+    if coil_heat_w is None:
+      coil_heat_w = (
+          constants.WATER_HEAT_CAPACITY
+          * constants.WATER_DENSITY
+          * self.total_flow_rate
+          * (
+              self.supply_water_temperature_sensor
+              - self.return_water_temperature_sensor
+          )
+      )
+    self._heat_source.apply_heat_draw(coil_heat_w, outside_temp, duration_s)
 
   def _calculate_flow_rate(
       self, differential_pressure: float, flow_factor: float

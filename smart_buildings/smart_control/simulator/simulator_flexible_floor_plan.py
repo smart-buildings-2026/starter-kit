@@ -520,6 +520,9 @@ class SimulatorFlexibleGeometries(simulator.Simulator[str]):
             total_reheat_w, coil_entering_air_temps
         )
     )
+    hvac.hot_water_system.apply_heat_draw(
+        ambient_temperature, self._time_step_sec
+    )
 
     # A guard against solver divergence, not a physical bound.
     #
