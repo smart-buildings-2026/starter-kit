@@ -516,6 +516,23 @@ def _create_floor_plan_generator(fp: FloorPlanConfig):
     return BSPFloorPlan(**kwargs)
 
 
+def check_zone_floor_areas(config: "ScenarioConfig") -> None:
+    """Raises ValueError if the config's floor plan would carry a sliver zone.
+
+    Runs the same seeded floor plan generation and the same check as
+    generate_scenario_from_config, without writing anything, so a building
+    config can be rejected when it is sampled rather than when a scenario is
+    built from it.
+    """
+    with _floor_plan_generation_lock:
+        if config.seed is not None:
+            random.seed(config.seed)
+            np.random.seed(config.seed)
+        generator = _create_floor_plan_generator(config.floor_plan)
+        generator.generate()
+        _check_generated_zone_areas(generator, CONTROL_VOLUME_CM, config.seed)
+
+
 # Weather preset directory, smart_buildings/weather.
 #
 # This walked up one level too many and landed on <repo>/weather, which does not

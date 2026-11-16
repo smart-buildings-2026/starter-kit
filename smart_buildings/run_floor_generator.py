@@ -59,7 +59,9 @@ from smart_buildings.smart_control.utils.materials import (
     facade_u,
 )
 from smart_buildings.smart_control.utils.scenario_generator import (
+    check_zone_floor_areas,
     list_recorded_weather_presets,
+    scenario_config_from_dict,
 )
 
 # Sampling ranges used for the shipped development buildings. Each range is
@@ -241,9 +243,21 @@ def main(argv=None) -> None:
         )
 
     written: list[Path] = []
+    skipped: list[int] = []
     for seed, mats in zip(seeds, materials):
         config = build_config(seed, f"building_{seed:04d}", args.shape, mats)
         summarize(config)
+        # Check every seed, not only the ones that get a PDF preview: the
+        # preview used to be the only place the floor plan was generated, so
+        # --no-pdf and --no-save let a sliver zone through to be found later,
+        # when a scenario is built from the YAML. A bad seed is skipped rather
+        # than ending the run, because a sizeable share of seeds produce one.
+        try:
+            check_zone_floor_areas(scenario_config_from_dict(config))
+        except ValueError as err:
+            print(f"    skipped seed {seed}: {err}")
+            skipped.append(seed)
+            continue
         if args.visualize and args.no_save:
             visualize_config(config, show=True)
         if not args.no_save:
@@ -251,10 +265,18 @@ def main(argv=None) -> None:
                 config, args.output_dir, save_pdf=not args.no_pdf, show=args.visualize
             )
 
+    kept = len(seeds) - len(skipped)
     if args.no_save:
-        print(f"\nDone (preview only). Generated {len(seeds)} building config(s).")
+        print(f"\nDone (preview only). Generated {kept} building config(s).")
     else:
         print(f"\nDone. Wrote {len(written)} file(s) to {args.output_dir}.")
+    if skipped:
+        print(
+            f"Skipped {len(skipped)} seed(s) whose floor plan has a zone below "
+            f"the minimum floor area: {skipped}. Pick other seeds to replace them."
+        )
+    if kept == 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
